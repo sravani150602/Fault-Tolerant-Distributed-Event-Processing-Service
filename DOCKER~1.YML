@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  event-processor:
+    build: .
+    ports:
+      - "9000:8080"
+    environment:
+      - AWS_REGION=us-east-1
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY}
+      - EVENTS_TABLE=event-processing-table
+      - S3_BUCKET=event-processing-bucket
+      - LOG_LEVEL=INFO
+    volumes:
+      - ./src:/var/task/src
