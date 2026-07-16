@@ -1,0 +1,223 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  Fault-Tolerant Distributed Event Processing Service
+  SAM template for deploying Lambda, API Gateway, DynamoDB, S3, and CloudWatch resources.
+
+Globals:
+  Function:
+    Timeout: 30
+    MemorySize: 256
+    Runtime: python3.11
+    Environment:
+      Variables:
+        EVENTS_TABLE: !Ref EventsTable
+        S3_BUCKET: !Ref EventsBucket
+        LOG_LEVEL: INFO
+
+Parameters:
+  Stage:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+  AlertEmail:
+    Type: String
+    Default: ""
+    Description: Email for CloudWatch alarm notifications
+
+Resources:
+  # ---- Lambda Function ----
+  EventProcessorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: !Sub "event-processor-${Stage}"
+      Handler: src.handlers.lambda_handler.lambda_handler
+      CodeUri: ../
+      Architectures: [x86_64]
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EventsTable
+        - S3CrudPolicy:
+            BucketName: !Ref EventsBucket
+        - CloudWatchPutMetricPolicy: {}
+      Events:
+        ApiPost:
+          Type: Api
+          Properties:
+            Path: /events
+            Method: POST
+            RestApiId: !Ref EventApi
+        ApiGet:
+          Type: Api
+          Properties:
+            Path: /events
+            Method: GET
+            RestApiId: !Ref EventApi
+        HealthCheck:
+          Type: Api
+          Properties:
+            Path: /health
+            Method: GET
+            RestApiId: !Ref EventApi
+        Metrics:
+          Type: Api
+          Properties:
+            Path: /metrics
+            Method: GET
+            RestApiId: !Ref EventApi
+        Reprocess:
+          Type: Api
+          Properties:
+            Path: /reprocess
+            Method: POST
+            RestApiId: !Ref EventApi
+        S3Trigger:
+          Type: S3
+          Properties:
+            Bucket: !Ref EventsBucket
+            Events: s3:ObjectCreated:*
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: events/
+                  - Name: suffix
+                    Value: .json
+        ScheduledReprocess:
+          Type: Schedule
+          Properties:
+            Schedule: rate(15 minutes)
+            Description: Reprocess failed events every 15 minutes
+            Enabled: true
+
+  # ---- API Gateway ----
+  EventApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      Name: !Sub "event-processing-api-${Stage}"
+      StageName: !Ref Stage
+      TracingEnabled: true
+
+  # ---- DynamoDB Table ----
+  EventsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "event-processing-table-${Stage}"
+      BillingMode: PROVISIONED
+      ProvisionedThroughput:
+        ReadCapacityUnits: 25
+        WriteCapacityUnits: 25
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+        - AttributeName: sk
+          KeyType: RANGE
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+        - AttributeName: sk
+          AttributeType: S
+        - AttributeName: idempotency_key
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: updated_at
+          AttributeType: "N"
+      GlobalSecondaryIndexes:
+        - IndexName: idempotency-index
+          KeySchema:
+            - AttributeName: idempotency_key
+              KeyType: HASH
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput:
+            ReadCapacityUnits: 10
+            WriteCapacityUnits: 10
+        - IndexName: status-index
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: updated_at
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+          ProvisionedThroughput:
+            ReadCapacityUnits: 10
+            WriteCapacityUnits: 10
+
+  # ---- S3 Bucket ----
+  EventsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "event-processing-bucket-${Stage}-${AWS::AccountId}"
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldEvents
+            Status: Enabled
+            ExpirationInDays: 90
+
+  # ---- SNS Topic for Alarms ----
+  AlarmTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "event-processing-alarms-${Stage}"
+
+  AlarmSubscription:
+    Type: AWS::SNS::Subscription
+    Condition: HasAlertEmail
+    Properties:
+      TopicArn: !Ref AlarmTopic
+      Protocol: email
+      Endpoint: !Ref AlertEmail
+
+  # ---- CloudWatch Alarms ----
+  HighErrorRateAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "EventProcessing-HighErrorRate-${Stage}"
+      AlarmDescription: High event processing error rate
+      Namespace: EventProcessingService
+      MetricName: EventsFailed
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 5
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref AlarmTopic
+      TreatMissingData: notBreaching
+
+  HighLatencyAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "EventProcessing-HighLatency-${Stage}"
+      AlarmDescription: High event processing latency
+      Namespace: EventProcessingService
+      MetricName: ProcessingLatency
+      ExtendedStatistic: p95
+      Period: 300
+      EvaluationPeriods: 3
+      Threshold: 500
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref AlarmTopic
+      TreatMissingData: notBreaching
+
+Conditions:
+  HasAlertEmail: !Not [!Equals [!Ref AlertEmail, ""]]
+
+Outputs:
+  ApiUrl:
+    Description: API Gateway endpoint URL
+    Value: !Sub "https://${EventApi}.execute-api.${AWS::Region}.amazonaws.com/${Stage}"
+  FunctionArn:
+    Description: Lambda function ARN
+    Value: !GetAtt EventProcessorFunction.Arn
+  TableName:
+    Description: DynamoDB table name
+    Value: !Ref EventsTable
+  BucketName:
+    Description: S3 bucket name
+    Value: !Ref EventsBucket
